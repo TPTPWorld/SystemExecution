@@ -1,0 +1,91 @@
+#!/usr/bin/perl -w
+
+use strict "vars";
+#-----------------------------------------------------------------------------
+my $TPTPDirectory = "/home/tptp";
+
+if (exists($ENV{TPTP_HOME})) {
+    $TPTPDirectory = $ENV{TPTP_HOME};
+}
+
+my $SystemsDirectory = "$TPTPDirectory/Systems";
+my $GetSystemInfoCommand = "$SystemsDirectory/GetSystemInfo";
+my $TPTPProblemsDirectory = "$TPTPDirectory/TPTP/Problems";
+my $TSTPSolutionsDirectory = "$TPTPDirectory/TSTP/Solutions";
+#-----------------------------------------------------------------------------
+
+    my $Problem;
+    my $Domain;
+    my @SystemsInfo;
+    my @WarnedAboutSystems;
+    my @Systems;
+    my $System;
+    my @SolutionFiles;
+    my $NewestFile;
+    my @NewestStat;
+    my $File;
+    my @FileStat;
+
+#----Make sure every directory has a problem, and every file has a system
+    @SystemsInfo = `$GetSystemInfoCommand -ts Status`;
+    @WarnedAboutSystems = ();
+    foreach $Domain (`ls -d $TSTPSolutionsDirectory/???`) {
+        chomp($Domain);
+        $Domain =~ s#.*/##;
+        foreach $Problem (`ls $TSTPSolutionsDirectory/$Domain`) {
+            chomp($Problem);
+            $Problem =~ s#.*/##;
+            if (!(-f "$TPTPProblemsDirectory/$Domain/${Problem}.p")) {
+                print(
+"WARNING: $Problem is no longer in the TPTP => delete solutions\n");
+            }
+#----Check systems' output files
+            @Systems = ();
+            @SolutionFiles = `ls $TSTPSolutionsDirectory/$Domain/$Problem`;
+            foreach $System (@SolutionFiles) {
+                chomp($System);
+                $System =~ s#.*/##;
+                $System =~ s#\.[A-Z]{3}-[A-Za-z]{3}\.[sf]$##;
+                if (!grep(/^\Q$System\E$/,@Systems)) {
+                    push(@Systems,($System));
+                }
+            }
+            foreach $System (@Systems) {
+#----Check for old systems output files
+                if (!grep(/\Q$System\E *=> .*TSTP/,@SystemsInfo)) {
+                    if (!grep(/\Q$System\E/,@WarnedAboutSystems)) {
+                        print(
+"WARNING: $System on $Problem is not TSTP => delete solutions\n");
+                        push(@WarnedAboutSystems,($System));
+                    }
+                    next;
+                }
+#----Check for multiple files
+                @SolutionFiles = `ls $TSTPSolutionsDirectory/$Domain/$Problem/${System}.*`;
+                if (scalar(@SolutionFiles) > 1) {
+                    $NewestFile = $SolutionFiles[0];
+                    chomp($NewestFile);
+                    @NewestStat = stat("$NewestFile");
+#DEBUG print("Assume $NewestFile with ctime $NewestStat[9] is newest\n");
+                    foreach $File (@SolutionFiles) {
+                        chomp($File);
+                        @FileStat = stat("$File");
+#DEBUG print("Compare with $File with ctime $FileStat[9]\n");
+                        if ($NewestStat[9] < $FileStat[9]) {
+                            $NewestFile = $File;
+                            @NewestStat = @FileStat;
+                        }
+                    }
+                    print("$NewestFile is the newest\n");
+                    foreach $File (@SolutionFiles) {
+                        if ($File ne $NewestFile) {
+                            print("    rm $File\n");
+                        }
+                    }
+                }
+            }
+        }
+    }
+print("OK, every directory has a problem, and every file has a system\n");
+
+#-----------------------------------------------------------------------------

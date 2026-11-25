@@ -1,0 +1,589 @@
+#!/usr/bin/perl -w
+
+#----Run a specified system on a specified TPTP problem
+
+use strict "vars";
+#--------------------------------------------------------------------------------------------------
+my $TPTPDirectory = "/home/tptp";
+
+if (exists($ENV{TPTP_HOME})) {
+    $TPTPDirectory = $ENV{TPTP_HOME};
+}
+if (! exists($ENV{TPTP})) {
+    $ENV{TPTP} = "$TPTPDirectory/TPTP";
+}
+if (! -d $ENV{TPTP}) {
+    die("ERROR: Cannot find TPTP directory\n");
+}
+
+my $SystemsDirectory = "$TPTPDirectory/Systems";
+my $GetSystemInfoCommand = "$SystemsDirectory/GetSystemInfo";
+my $SystemExecutionDirectory = "$TPTPDirectory/SystemExecution";
+my $TreeLimitedRunCommand = "$SystemExecutionDirectory/TreeLimitedRun";
+my $RunSolverCommand = "$SystemExecutionDirectory/runsolver -w /dev/null ";
+my $RunSolverFormatString = "%s %s -C %d -W %d -M %d --delay 1 --timestamp --add-eof %s";
+#---- my $RunSolverCommand = "$SystemExecutionDirectory/ResourceLimitedRun";
+my $X2tptpFormatterCommand = "$TPTPDirectory/TSTP/X2TPTP/X2tptpExtractor";
+my $SPCForTPTPProblem = "$TPTPDirectory/SPCs/SPCForTPTPProblem";
+my $SPCForProblem = "$TPTPDirectory/SPCs/SPCForProblem";
+my $GetMachineName = "/bin/hostname";
+
+require "$SystemExecutionDirectory/SystemOnTPTPLib";
+
+#----If you want execution of the ATP system to be done on a certain computer,
+#----e.g., not on your desktop but some other work computer, then set the
+#----following variables. The $ExpectedMachineName is a regexp to match the
+#----return from $GetMachineName, and if it does not match then the job is
+#----transferred to the $ExecutionMachine using $rshCommand.
+my $ExpectedMachineName = ".*";
+my $ExecutionMachine = "wombat.cs.miami.edu";
+my $rshCommand = "ssh";
+
+my $NiceCommand = "/bin/nice -n";
+my $DefaultTemporaryDirectory = "/tmp/SystemOnTPTP$$";
+my $SPCForProblemTimeLimit = 30;
+
+#----Global for use by signal handler
+my $GlobalPIDToStop = 0;
+my $GlobalInterrupted = 0;
+
+#----Global for use in END statements
+my $GlobalKeepTemporaryDirectory;
+my $GlobalTemporaryDirectory;
+
+#--------------------------------------------------------------------------------------------------
+DoMain();
+#--------------------------------------------------------------------------------------------------
+sub DoMain {
+
+#----Send QUIT signals to the right place
+    $SIG{'QUIT'} = 'QUITHandler';
+    $SIG{'XCPU'} = 'QUITHandler';
+    $SIG{'INT'}  = 'QUITHandler';
+    $SIG{'PIPE'} = 'QUITHandler';
+    $SIG{'ALRM'} = 'ALRMHandler';
+#    $SIG{'CHLD'} = 'SIGCHLDHandler';
+
+#----Send STDERR to STDOUT
+    close(STDERR);
+    open(STDERR,">&STDOUT");
+#----Flush output
+    $| = 1;
+
+    ($GlobalTemporaryDirectory,$GlobalKeepTemporaryDirectory) = 
+RunSystemOnTPTP($DefaultTemporaryDirectory);
+
+    END {
+        if (!$GlobalKeepTemporaryDirectory && defined($GlobalTemporaryDirectory)) {
+            system("rm -rf $GlobalTemporaryDirectory");
+        }
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub SystemOnTPTPVersionSetup {
+    my ($QuietFlag,@CommandLineArguments) = @_;
+
+    my $Argument;
+    my $ThisMachineName;
+    my $ThisScriptCommand = "$SystemExecutionDirectory/SystemOnTPTP";
+
+    if (!defined($ThisMachineName = `$GetMachineName`)) {
+        die("ERROR: Cannot get this machine name\n");
+    }
+    chomp($ThisMachineName);
+
+#----Check that we're on the right machine, else rsh across
+    if ($ThisMachineName !~ /$ExpectedMachineName/i) {
+        QuietPrint($QuietFlag,2,"Moving onto $ExecutionMachine\n");
+#----Quote the arguments before rsh
+        foreach $Argument (@ARGV) {
+            $Argument =~ s/^/'/;
+            $Argument =~ s/$/'/;
+        }
+        exec("$rshCommand $ExecutionMachine $ThisScriptCommand $QuietFlag @CommandLineArguments");
+        die("Could not exec rsh $ExecutionMachine\n");
+    } else {
+#----Set the execution machine to be this one
+        $ExecutionMachine = $ThisMachineName;
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub CHLDHandler {
+    my ($Signal) = @_;
+    
+    printf("A child of SystemOnTPTP $$ died\n");
+}
+#---------------------------------------------------------------------------------------------------
+sub ALRMHandler {
+    my ($Signal) = @_;
+    
+#DEBUG print("!!!SystemOnTPTP $$ received a $Signal\n");
+
+#DEBUG print("!!!$GlobalPIDToStop did not stop on QUIT, now KILL\n");
+#----SIGKILL doesn't work. Have to use -9 (but does that kill the group?)
+#    kill('SIGKILL',$GlobalPIDToStop);
+    QUITHandler('SIGXCPU');
+}
+#---------------------------------------------------------------------------------------------------
+sub QUITHandler {
+    my ($Signal) = @_;
+
+    $GlobalInterrupted = 1;
+    SetGlobalInterruptedInLib();
+
+    if ($GlobalPIDToStop > 0) {
+#DEBUG print("!!!SystemOnTPTP $$ stops child $GlobalPIDToStop with $Signal\n");
+        kill($Signal,$GlobalPIDToStop);
+    } else {
+#DEBUG print("!!!SystemOnTPTP $$ prover never got started, so I won't kill it\n");
+    }
+
+    if ($Signal eq 'INT') {
+        die("Terminated by ^C\n");
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub DoSystemOnTPTP {
+    my ($QuietFlag,$ForceSystemFlag,$TemporaryDirectory,$System,@FlagsTimeAndProblems) = @_;
+
+    my @ProblemFiles;
+    my $ProblemFile;
+    my $Problem;
+    my $Format;
+    my $Transform;
+    my $TimeLimit;
+    my $WCTimeLimit;
+    my $MemoryLimit;
+    my $NiceValue;
+    my $NeedToPrepareProblems;
+    my $NeedOtter2TPTP;
+    my $UseX2tptp;
+    my $UsingSoTFlag;
+    my $PreparedFile;
+    my @PreparedFiles;
+    my $ExecuteFormatString;
+    my $Status;
+    my $CPUTime;
+    my $RealTime;
+    my $OutputStatus;
+    my $OutputCPUTime;
+    my $OutputRealTime;
+    my $StatisticValues;
+    my $CanDo;
+
+#----Check all parameters
+    ($ExecuteFormatString,$Format,$Transform,$TimeLimit,$WCTimeLimit,$MemoryLimit,$NiceValue,
+$NeedToPrepareProblems,$NeedOtter2TPTP,$UseX2tptp,$UsingSoTFlag,@ProblemFiles) = 
+CheckParameters($QuietFlag,$System,$TemporaryDirectory,@FlagsTimeAndProblems);
+
+#DEBUG print("ExecuteFormatString = $ExecuteFormatString\n");
+#DEBUG print("Format              = $Format\n");
+#DEBUG print("Transform           = $Transform\n");
+#DEBUG print("TimeLimit           = $TimeLimit\n");
+#DEBUG print("ProblemFiles        = @ProblemFiles\n");
+
+#----Convert from Otter format
+    if ($NeedOtter2TPTP) {
+        @ProblemFiles = ConvertFromOtter($QuietFlag,$TemporaryDirectory,@ProblemFiles);
+    }
+#----Prepare problem with tptp2X or tptp4X or whatever
+    if ($NeedToPrepareProblems) {
+        @PreparedFiles = PrepareProblems($QuietFlag,$TemporaryDirectory,$System,$Transform,$Format,
+@ProblemFiles);
+    } else {
+        @PreparedFiles = @ProblemFiles;
+    }
+
+#----Execute the system
+    foreach $PreparedFile (@PreparedFiles) {
+
+#----Extract problem name for reporting
+#----First case is output from tptp2X or tptp4X
+#DEBUG print("%>>>$PreparedFile<<<\n");
+        if ($PreparedFile =~ / -> /) {
+            ($ProblemFile,$PreparedFile) = ($PreparedFile =~ /(.*) -> (.*)/);
+            $Problem = `basename '$ProblemFile'`;
+            chomp($Problem);
+            $Problem =~ s/\.[a-z]*$//;
+#----Other case is direct list of files, not run through tptp2X or tptp4X
+        } else {
+            $ProblemFile = shift(@ProblemFiles);
+            $Problem = `basename '$ProblemFile' '\\.[a-z]*'`;
+            chomp($Problem);
+            $Problem =~ s/\.[a-z]*$//;
+        }
+        if (!defined($Problem)) {
+           die("Could not get basename from $ProblemFile\n");
+        }
+
+#----Check if the problem is suitable for this system's SPCs. 
+        if ($ForceSystemFlag eq "-force") {
+            QuietPrint($QuietFlag,1,"$System   is forced to process that problem/solution\n");
+            $CanDo = 1;
+        } elsif ($TimeLimit <= 0) {
+#----TimeLimit < 0 means just postprocessing, so cope!
+            $CanDo = 1;
+        } else {
+            $CanDo = SystemCanDoProblem($QuietFlag,$System,$Problem,$ProblemFile);
+        }
+        if ($CanDo == 0) {
+            QuietPrint($QuietFlag,2,
+"$System   is unable to process that form of problem/solution\n");
+            ($Status,$CPUTime,$RealTime,$OutputStatus,$OutputCPUTime,$OutputRealTime,
+$StatisticValues) = ("Inappropriate",0.0,0.0,"None",0.0,0.0,"");
+        } elsif ($CanDo == -1 && $Format ne "tptp:raw") {
+#----Some error in SystemCanDoProblem. Error has been reported there. But ignore for tptp:raw 
+#----systems that can probably cope.
+            ($Status,$CPUTime,$RealTime,$OutputStatus,$OutputCPUTime,$OutputRealTime,
+$StatisticValues) = ("Error (getting SPC)",0.0,0.0,"None",0.0,0.0,"");
+        } else {
+            if ($CanDo == -1 && $Format =~ /.*:raw/) {
+                QuietPrint($QuietFlag,2,"$System   being fed the raw form of $Problem\n");
+            }
+            ($Status,$CPUTime,$RealTime,$OutputStatus,$OutputCPUTime,$OutputRealTime,
+$StatisticValues) = ExecuteSystem($QuietFlag,$System,$Problem,$PreparedFile,$ExecuteFormatString,
+$TimeLimit,$WCTimeLimit,$MemoryLimit,$NiceValue,$UseX2tptp,$UsingSoTFlag);
+#----If a FOF problem with a conjecture, convert Unsatisfiable to Theorem
+            $Status = FixFOFResult($Status,$PreparedFile);
+        }
+
+#----Report the result only if not piping to X2tptp (in which case it is
+#----done in ExecuteSystem - AAAARGH this is getting into a hack!
+        if (!$UseX2tptp || QuietLevelFromFlag($QuietFlag) <= 2) {
+            ReportResult($QuietFlag,"RESULT:",$System,$Problem,$Status,$CPUTime,$RealTime,
+$StatisticValues);
+            ReportResult($QuietFlag,"OUTPUT:",$System,$Problem,$OutputStatus,$OutputCPUTime,
+$OutputRealTime,"");
+        }
+
+#----Bail out if interrupted
+        if ($GlobalInterrupted) {
+            last;
+        }
+    }
+}
+#---------------------------------------------------------------------------------------------------
+#----A cut down version of this without SPCForProblem is in UpdateTSTP
+sub SystemCanDoProblem {
+    my ($QuietFlag,$System,$Problem,$ProblemFile) = @_;
+
+    my $SPCOfProblem;
+    my @SPCsOfProblem;
+    my $SPCOfSystem;
+    my @SPCsOfSystem;
+    my $SPCOfSystemComponent;
+    my @SPCOfSystemComponents;
+    my $SPCOK;
+    my @SPCForProblemOutput;
+
+    my @CheckTheseSPCComponents = (
+"NHF","NH1","NH0",
+"NXF","NX1","NX0",
+"THF","TH1","TH0",
+"TXF","TX1","TX0",
+"TFF","TF1","TF0",
+"FOF","CNF","RFO","NEQ","SEQ","PEQ","HRN","UEQ","EPR","PRP","ARI","NAR");
+
+#----Get SPCs capacity for system
+    if (!(-x $GetSystemInfoCommand)) {
+        die("ERROR: $GetSystemInfoCommand not available\n");
+    }
+    $SPCOfSystem = `$GetSystemInfoCommand $System SPCs`;
+    chomp($SPCOfSystem);
+#DEBUG print("% SPCOfSystem $SPCOfSystem\n");
+    ($SPCOfSystem) = ($SPCOfSystem =~ /.*=> *([^;]*); *$/);
+#----If no SPCs then assume all
+    if ($SPCOfSystem eq "" || $SPCOfSystem eq "NO INFORMATION") {
+        return(1);
+    }
+
+#----Get SPC of problem. First try quick look if from TPTP
+    if (!(-x $SPCForTPTPProblem)) {
+        die("ERROR: $SPCForTPTPProblem not available\n");
+    }
+#DEBUG print("% TRY $SPCForTPTPProblem $ProblemFile\n");
+    $SPCOfProblem = `$SPCForTPTPProblem '$ProblemFile'`;
+    chomp($SPCOfProblem);
+#DEBUG print("%=TPTP===$SPCOfProblem===\n");
+#----If was not TPTP problem or something, do from scratch
+    if (grep(/ERROR/,$SPCOfProblem)) {
+        if (!(-x $SPCForProblem)) {
+            die("ERROR: $SPCForProblem not available\n");
+        }
+#----If problem file not found (TPTP problem without SPC?) assume OK
+        if (! -e $ProblemFile) {
+            QuietPrint($QuietFlag,2,
+"WARNING: Guessing that $System can cope with this non-TPTP problem\n");
+            return(1);
+        }
+#DEBUG system("cat \"$ProblemFile\"");
+#DEBUG print("Doing: $RunSolverCommand -C $SPCForProblemTimeLimit $SPCForProblem $ProblemFile\n");
+        @SPCForProblemOutput = `$RunSolverCommand -C $SPCForProblemTimeLimit $SPCForProblem "$ProblemFile"`;
+#DEBUG print("SPCForProblem says\n@SPCForProblemOutput");
+        $SPCOfProblem = $SPCForProblemOutput[0];
+#DEBUG print("The first line of output is $SPCOfProblem\n");
+        chomp($SPCOfProblem);
+    }
+#DEBUG print("% RAW SPCForProblemOutput ===@SPCForProblemOutput===\n");
+#----If something went wrong then no hope
+    if ($SPCOfProblem =~ /^ERROR/) {
+        if ($SPCOfProblem =~ /MakeTreeStats ran out of CPU time/) {
+            QuietPrint($QuietFlag,2,
+"WARNING: Guessing that $System can cope with this problem (timeout getting the SPC)\n");
+            return(1);
+        } else {
+#            QuietPrint($QuietFlag,2,
+#"WARNING: Guessing that $System can't cope with this problem (error getting the SPC)\n");
+            return(-1);
+        }
+    }
+    @SPCsOfProblem = split(/_/,$SPCOfProblem);
+#DEBUG print("% SPCsOfProblem @SPCsOfProblem\n");
+
+    @SPCsOfSystem = split(/ +/,$SPCOfSystem);
+#DEBUG print("% SPCsOfSystem @SPCsOfSystem\n");
+#----Check if any one of the system's SPCs covers this problem
+    foreach $SPCOfSystem (@SPCsOfSystem) {
+        @SPCOfSystemComponents = split(/_/,$SPCOfSystem);
+#----If any meaningful component cannot be found in problem, fail this one
+#DEBUG print("% Checking if problem is @SPCOfSystemComponents\n");
+        $SPCOK = 1;
+        foreach $SPCOfSystemComponent (@SPCOfSystemComponents) {
+#DEBUG print("% Checking if problem component is $SPCOfSystemComponent\n");
+            if (grep(/$SPCOfSystemComponent/,@CheckTheseSPCComponents) &&
+!grep(/$SPCOfSystemComponent/,@SPCsOfProblem)) {
+#DEBUG print("% Nope problem is not $SPCOfSystemComponent\n");
+                $SPCOK = 0;
+                last;
+            }
+        }
+        if ($SPCOK) {
+#DEBUG print("% Problem is @SPCOfSystemComponents\n");
+            return(1);
+        }
+    }
+#DEBUG print("% Nope, can't cope\n");
+    return(0);
+}
+#---------------------------------------------------------------------------------------------------
+sub ExecuteSystem {
+    my ($QuietFlag,$System,$Problem,$ProblemFile,$ExecuteFormatString,$TimeLimit,$WCTimeLimit,
+$MemoryLimit,$NiceValue,$UseX2tptp,$UsingSoTFlag) = @_;
+
+    my $ExecuteString;
+    my $PrintExecuteString;
+    my $TimeLimitedExecuteString;
+    my $ThisNiceCommand;
+    my $SystemFileHandle = "SystemFileHandle";
+    my $ATPSystemPID;
+    my $Status;
+    my $CPUTime;
+    my $RealTime;
+    my $OutputStatus;
+    my $OutputCPUTime;
+    my $OutputRealTime;
+    my $StatisticValues;
+    my $OldSTDOUT = "OldSTDOUT";
+    my $X2tptpExtractorHandle = "X2tptpExtractorHandle";
+    my $RunQuietFlag;
+    my $ProblemTPTPVersion;
+
+#DEBUG print("ProblemFile $ProblemFile\n");
+#DEBUG print("Problem $Problem\n");
+
+    if ($TimeLimit == 0) {
+        return("Success",0,0,"None",0,0,"");
+    }
+
+#----Prepare for child process
+    $ExecuteString = CreateExecuteString($ExecuteFormatString,"'$ProblemFile'",$TimeLimit);
+#----Hide -p fields from printed ExecuteString because they are Q&A passwords
+#----That sucks because it hides some other types of -p parameters
+    $PrintExecuteString = $ExecuteString;
+    $PrintExecuteString =~ s/ -p [^ ]* / /;
+    QuietPrint($QuietFlag,2,"$System   being executed on $Problem using $PrintExecuteString\n");
+
+#----Build a nice command if needed
+    if ($NiceValue != 0) {
+        $ThisNiceCommand = "$NiceCommand $NiceValue";
+    } else {
+        $ThisNiceCommand = "";
+    }
+#DEBUG print("The nice command is ==$ThisNiceCommand==\n");
+
+#----Negative time limit is postprocessing only, and I'll trust that
+    if ($TimeLimit >= 0) {
+        $TimeLimitedExecuteString = sprintf($RunSolverFormatString,
+$ThisNiceCommand,$RunSolverCommand,$TimeLimit,$WCTimeLimit,$MemoryLimit,$ExecuteString);
+    } else {
+        $TimeLimitedExecuteString = $ExecuteString;
+    }
+
+#----These lines added to prevent the pipe hack
+    NoNastyUNIX($TimeLimitedExecuteString);
+#----At last moment check for interrupt
+    if (!$GlobalInterrupted) {
+#DEBUG print("Run TimeLimitedExecuteString ==$TimeLimitedExecuteString== ");
+#DEBUG system("date '+%T %N'");
+#----Store the PID globally for interrupt handler
+        if (!defined($ATPSystemPID = open($SystemFileHandle,"-|"))) {
+            die("ERROR: Cannot fork system process\n");
+        }
+    
+#----Check which process we're in. 0 means child
+        if ($ATPSystemPID == 0) {
+#----Close the pipe to read from
+            close($SystemFileHandle);
+#----Maybe interrupt comes during open => no value in $GlobalPIDToStop
+#----while in interrupt handler, but really the child must not start
+            exec($TimeLimitedExecuteString) or
+die("Cannot exec $TimeLimitedExecuteString\n");
+
+#----Otherwise in parent
+        } else {
+            $GlobalPIDToStop = $ATPSystemPID;
+            if ($GlobalInterrupted) {
+#----Allow the exec to bite in the child before stopping it
+                sleep(1);
+                QUITHandler('QUIT');
+            }
+#----Special set up for X2tptp post processing, pass this process' STDOUT to
+#----X2tptpExtractor (to avoid lots of programming :-)
+#----THIS IS WHERE I NEED TO FIX, SO I CAN ECHO THE OUTPUT AND CATCH THE X2TPTP
+#----OUTPUT TO ECHO
+            if ($UseX2tptp) {
+                $ProblemTPTPVersion = GetProblemTPTPVersion($ProblemFile);
+#----These lines added to prevent the pipe hack
+                NoNastyUNIX("$X2tptpFormatterCommand $UsingSoTFlag $System $Problem $ProblemTPTPVersion $ProblemFile $ExecutionMachine $TimeLimit --");
+#----Place the same time limit on postprocessing - should really be combined but that requires big
+#----changes and postprocessing time is seldom a big issue. Also, there's a moral debate whether
+#----the system should be charged for my postprocessing time.
+                $TimeLimitedExecuteString = sprintf("%s %s -C %d -W %d -M %d --delay 1 %s",
+$ThisNiceCommand,$RunSolverCommand,$TimeLimit,$WCTimeLimit,$MemoryLimit,
+"$X2tptpFormatterCommand $UsingSoTFlag $System '$Problem' '$ProblemTPTPVersion' '$ProblemFile' $ExecutionMachine $TimeLimit --");
+#DEBUG print("WOULD I RUN ===$TimeLimitedExecuteString===\n");
+                $GlobalPIDToStop = open($X2tptpExtractorHandle,"|$TimeLimitedExecuteString") or
+die("ERROR: Cannot run X2tptpExtractor");
+                open($OldSTDOUT,">&STDOUT") or 
+die("ERROR: Can't dup STDOUT: $!");
+                close(STDOUT);
+                open(STDOUT,">&$X2tptpExtractorHandle") or 
+die("ERROR: Cannot dup STDOUT to X2tptpExtractor");
+                $| = 1;
+                $RunQuietFlag = "-q1";
+            } else {
+                $RunQuietFlag = $QuietFlag;
+            }
+
+            ($Status,$CPUTime,$RealTime,$OutputStatus,$OutputCPUTime,$OutputRealTime,
+$StatisticValues) = StatusFromSystemOutput($RunQuietFlag,$SystemFileHandle,$System,$TimeLimit,
+$WCTimeLimit);
+#DEBUG print("Ran TimeLimitedExecuteString ==$TimeLimitedExecuteString== ");
+#DEBUG system("date '+%T %N'");
+
+            if ($UseX2tptp) {
+                $Status = FixFOFResult($Status,$ProblemFile);
+#----Report the result (duplicated from above - needed for -S flag)
+                ReportResult($RunQuietFlag,"RESULT:",$System,$Problem,$Status,$CPUTime,$RealTime,
+$StatisticValues);
+                ReportResult($RunQuietFlag,"OUTPUT:",$System,$Problem,$OutputStatus,
+$OutputCPUTime,$OutputRealTime,"");
+#----If these closes are done in the other order then X2tptpExtractor does 
+#----not end, and I don't know why.
+                close(STDOUT);
+                close($X2tptpExtractorHandle);
+                open(STDOUT,">&$OldSTDOUT") or die("ERROR: Can't undup STDOUT: $!");
+            }
+
+#----Close file handle
+            close($SystemFileHandle);
+
+#----Wait in either case for child to end
+#----No need to wait, as it seems by using open to start the process
+#----this has been taken care of. How I wonder? Maybe in close.
+#        if (waitpid($ForkPID,64) == -1) {
+#            print("WARNING: SystemOnTPTP $$ child $ForkPID has disappeared\n");
+#        }
+        }
+    } else {
+        ($Status,$CPUTime,$RealTime,$OutputStatus,$OutputCPUTime,$OutputRealTime,
+$StatisticValues) = ("Unknown",0,0,"None",0,0,"");
+    }
+
+    return($Status,$CPUTime,$RealTime,$OutputStatus,$OutputCPUTime,$OutputRealTime,
+$StatisticValues) ;
+}
+#---------------------------------------------------------------------------------------------------
+sub GetProblemTPTPVersion {
+    my ($FileName) = @_;
+
+    my %ProblemHeaderFields;
+    my $ProblemTPTPVersion;
+
+    %ProblemHeaderFields = GetHeaderFields("$FileName");
+    if (exists($ProblemHeaderFields{"File"})) {
+        ($ProblemTPTPVersion) = ($ProblemHeaderFields{"File"} =~
+/.*(TPTP v\d+\.\d+\.\d+\. .* v\d+\.\d+\.\d+)\. *$/);
+    } else {
+        undef($ProblemTPTPVersion);
+    }
+
+    if (!defined($ProblemTPTPVersion)) {
+        $ProblemTPTPVersion = "v?.?.?";
+    }
+
+    return($ProblemTPTPVersion);
+}
+#---------------------------------------------------------------------------------------------------
+sub GetHeaderFields {
+    my ($FileName) = @_;
+
+    my $ProblemFileHandle = "ProblemFileHandle";
+    my $FileLine;
+    my $CommentChar;
+    my $FieldName;
+    my $FieldContent;
+    my $MoreContent;
+    my %HeaderFields;
+
+#----These lines added to prevent the pipe hack
+    NoNastyUNIX($FileName);
+#DEBUG print("Getting header fields from $FileName\n");
+    open($ProblemFileHandle,"<$FileName") or
+die("ERROR: Cannot open $FileName to get headers\n");
+
+    $FileLine = <$ProblemFileHandle>;
+    while (defined($FileLine) && 
+!(defined($FieldName) && ($FieldName eq "Comments"))) {
+        chomp($FileLine);
+#DEBUG print("File line is ==$FileLine==\n");
+#----Does it look like a header field
+        if ($FileLine =~ /^[^ \w] \w* +:/) {
+            ($CommentChar,$FieldName) = ($FileLine =~ /^(.) (\w+) +:/);
+#DEBUG print("Found $FieldName\n");
+            ($FieldContent) = 
+($FileLine =~ /^$CommentChar $FieldName +: *(.*)/);
+#----Allow for empty field content, but more on a following line
+            if (!defined($FieldContent)) {
+                $FieldContent = "";
+            }
+            $FileLine = <$ProblemFileHandle>;
+            while (defined($FileLine) && 
+$FileLine =~ /^$CommentChar      +/) {
+                chomp($FileLine);
+                ($MoreContent) = ($FileLine =~ /^$CommentChar +(.*)/);
+                $FieldContent .= "\n$MoreContent";
+                $FileLine = <$ProblemFileHandle>;
+            }
+#DEBUG print("Field name = $FieldName\n");
+#DEBUG print("Field content = $FieldContent\n");
+            $HeaderFields{$FieldName} = $FieldContent;
+        } else {
+            $FileLine = <$ProblemFileHandle>;
+        }
+    }
+    close($ProblemFileHandle);
+
+    return(%HeaderFields);
+}
+#--------------------------------------------------------------------------------------------------

@@ -1,0 +1,1276 @@
+#--------------------------------------------------------------------------------------------------
+use strict "vars";
+use File::Temp qw/ mkstemp /;
+#--------------------------------------------------------------------------------------------------
+my $TPTPDirectory = "/home/tptp";
+
+if (exists($ENV{TPTP_HOME})) {
+    $TPTPDirectory = $ENV{TPTP_HOME};
+}
+
+my $SystemsDirectory = "$TPTPDirectory/Systems";
+my $GetSystemInfoCommand = "$SystemsDirectory/GetSystemInfo";
+my $LibraryDirectory = "$TPTPDirectory/TPTP";
+my $ProblemsDirectory = "$LibraryDirectory/Problems";
+my $PPCFilename = "$TPTPDirectory/SystemExecution/ProblemPreparationConstraints";
+my $tptp2XCommand = "$LibraryDirectory/TPTP2X/tptp2X";
+my $ServiceDirectory = "$TPTPDirectory/ServiceTools";
+my $Otter2TPTPCommand = "$ServiceDirectory/Otter2TPTP/Otter2TPTP";
+my $tptp4XCommand = "$ServiceDirectory/tptp4X";
+my $CatEchoCommand = "cat %s";
+my $GrepCommand = "grep";
+
+#----System parameter
+my $MaximalTimeLimit = 72000;
+my $CPUWCLimitScaleFactor = 2;
+# my $DefaultMemoryLimit = "256000000";
+my $DefaultMemoryLimit = "0";
+my $DefaultNiceValue = "0";
+#----Scale CPU time up for not solved to make Timeout
+my $NotSolvedCPUTimeScale = 1.05;
+
+#----Solution strings to use
+my $TimeoutStatus = "Timeout";
+my $UnknownStatus = "Unknown";
+my $AssuranceStatus = "Assurance";
+my $NoneStatus = "None";
+
+#----Fucking globals in perl
+my $GlobalInterruptedInLib = 0;
+#--------------------------------------------------------------------------------------------------
+sub SetGlobalInterruptedInLib {
+
+    $GlobalInterruptedInLib = 1;
+}
+#--------------------------------------------------------------------------------------------------
+sub RunSystemOnTPTP {
+    my ($TemporaryDirectory) = @_;
+
+    my $QuietFlag;
+    my $KeepTemporaryDirectory;
+
+    InfoOptions();
+    $QuietFlag = GetQuietFlag();
+    SystemOnTPTPVersionSetup($QuietFlag,@ARGV);
+    ($TemporaryDirectory,$KeepTemporaryDirectory) = CommonStartSystemOnTPTP($QuietFlag,
+$TemporaryDirectory,@ARGV);
+
+    return($TemporaryDirectory,$KeepTemporaryDirectory);
+}
+#--------------------------------------------------------------------------------------------------
+sub InfoOptions {
+
+    if (scalar(@ARGV) == 0 || $ARGV[0] eq "-h") {
+        Usage();
+        die("\n");
+    }
+
+    if ($ARGV[0] eq "-w") {
+        shift(@ARGV);
+        ListAvailableSystems(@ARGV);
+        die("\n");
+    }
+
+}
+#--------------------------------------------------------------------------------------------------
+sub Usage {
+
+    print("
+Usages are 
+    SystemOnTPTP -h|-w
+    SystemOnTPTP [-qN] [-force] [-k tmpdir] system [flags] time_limit [-m memory_limit in MB] [-n nice_value] [-S] [-F|-O] problems | -l|-L problem_list_file
+");
+}
+#--------------------------------------------------------------------------------------------------
+sub ListAvailableSystems {
+    my (@Args) = @_;
+
+    my $ListStatus;
+    my @Systems;
+    my $System;
+
+    if (!defined($ListStatus = shift(@Args))) {
+        $ListStatus = "READY";
+    } 
+
+    @Systems = `$GetSystemInfoCommand Status @Args`;
+    foreach $System (@Systems) {
+        chomp($System);
+        if ($System =~ /=> [^;]*$ListStatus/) {
+            $System =~ s/=> [^;]*;/=> /;
+            if ($System =~ /=> *$/) {
+                $System =~ s/ *=> *$//;
+            }
+            print("$System\n");
+        }
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub GetQuietFlag {
+
+    my $QuietFlag;
+
+#----Check for quiet argument
+    if (defined($QuietFlag = $ARGV[0]) && $QuietFlag =~ /^-q\d/) {
+        shift(@ARGV);
+    } else {
+        $QuietFlag = "-q0";
+    }
+
+    return($QuietFlag);
+}
+#--------------------------------------------------------------------------------------------------
+sub CommonStartSystemOnTPTP {
+    my ($QuietFlag,$TemporaryDirectory,@CommandLineArguments) = @_;
+
+    my $ForceSystemFlag;
+    my $KeepTemporaryDirectory;
+    my @SystemNames;
+    my $SystemName;
+
+#----Redirect STDERR to STDOUT
+    close(STDERR);
+    open(STDERR,">&STDOUT") || die("Cannot redirect STDERR to STDOUT\n");
+#----Flush output
+    $| = 1;
+
+#----Check if systems is forced to try this problem - no checking will be done
+    if (defined($ForceSystemFlag = $CommandLineArguments[0]) && $ForceSystemFlag eq "-force") {
+        shift(@CommandLineArguments);
+    } else {
+        $ForceSystemFlag = "";
+    }
+
+#----Check for a user defined temporary directory which must be saved
+    if (defined($CommandLineArguments[0]) && 
+$CommandLineArguments[0] eq "-k") {
+        shift(@CommandLineArguments);
+        if (defined($TemporaryDirectory = shift(@CommandLineArguments)) &&
+$TemporaryDirectory =~ /^[\/\.]/) {
+            $KeepTemporaryDirectory = 1;
+        } else {
+            Usage();
+            die("\n");
+        }
+    } else {
+        $KeepTemporaryDirectory = 0;
+    }
+
+#----Check there were enough parameters
+    if (@ARGV < 3) {
+        Usage();
+        die("\n");
+    }
+
+#----Make the temporary directory
+    if (! -d $TemporaryDirectory) {
+        if (!mkdir($TemporaryDirectory,0777)) {
+            print("ERROR: Cannot make temp dir $TemporaryDirectory\n");
+            die("\n");
+        }           
+    }
+#----Change permissions so tptp can cleanup later if needed
+    system("chmod 0777 $TemporaryDirectory");
+
+#----Run the systems. The CommandLineArguments may have multiple system specifications. Multiple
+#----systems cannot have non-default parameters, except for the last system.
+    @SystemNames = ();
+    while ($CommandLineArguments[0] =~ /---/) {
+        push(@SystemNames,CompleteSystemName($QuietFlag,$CommandLineArguments[0]));
+        shift(@CommandLineArguments);
+    }
+    foreach $SystemName (@SystemNames) {
+        DoSystemOnTPTP($QuietFlag,$ForceSystemFlag,$TemporaryDirectory,$SystemName,
+@CommandLineArguments);
+#----Stop if interrupted
+        if ($GlobalInterruptedInLib) {
+            last;
+        }
+    }
+
+    return($TemporaryDirectory,$KeepTemporaryDirectory);
+}
+#--------------------------------------------------------------------------------------------------
+sub CompleteSystemName {
+    my ($QuietFlag,$RequestedSystemName) = @_;
+
+    my @SystemNames;
+    my @SystemInfoLines;
+    my $System;
+
+    @SystemNames = ();
+    @SystemInfoLines = `$GetSystemInfoCommand $RequestedSystemName Status`;
+    if (scalar(@SystemInfoLines) == 0) {
+        print("WARNING: $RequestedSystemName does not exist - ignored\n");
+    } else {
+        foreach $System (@SystemInfoLines) {
+            if ($System =~ /READY/) {
+                chomp($System);
+                $System =~ s/ .*//;
+                push(@SystemNames,($System));
+            } else {
+                chomp($System);
+                $System =~ s/ .*//;
+                QuietPrint($QuietFlag,1,"$System is not READY\n");
+            }
+        }
+    }
+
+    return(@SystemNames);
+}
+#--------------------------------------------------------------------------------------------------
+sub CheckParameters {
+    my ($QuietFlag,$System,$TemporaryDirectory,@FlagsTimeAndProblems) = @_;
+
+    my $ProblemFile;
+    my $Problem;
+    my $ProblemListFile;
+    my $ProblemListHandle = "ProblemListHandle";
+    my @ProblemFiles;
+    my $ExecuteFormatString;
+    my $OldBinary;
+    my $NewArgs;
+    my $Format;
+    my $Transform;
+    my $TimeLimit;
+    my $WCTimeLimit;
+    my $NiceValue;
+    my $MemoryLimit;
+    my $SystemMemoryLimit;
+    my $NeedFormatter;
+    my $NeedOtter2TPTP;
+    my $UseX2tptp;
+    my $UsingSoTFlag;
+    my $SystemInfo;
+    my $SystemExecutable;
+    my $SystemParameters;
+    my $OptionalFlag;
+    my $OptionalFlagValue;
+    my $TempHandle;
+    my $Line;
+
+#----Set up defaults which may be overridden
+    $MemoryLimit = $DefaultMemoryLimit;
+    $NiceValue = $DefaultNiceValue;
+
+#----Get system information
+    QuietPrint($QuietFlag,2,"$System   system information being retrieved\n");
+    NoNastyUNIX("$GetSystemInfoCommand Command MemoryLimit Format Transform");
+    ($SystemInfo) = grep(/^\Q$System\E *=>/,
+`$GetSystemInfoCommand Command MemoryLimit Format Transform`);
+#----Check there is exactly one system
+    if (!defined($SystemInfo)) {
+        system("rm -rf $TemporaryDirectory\n");
+        die("ERROR: $System is not listed or is multiply defined\n");
+    }
+#----Extract required components
+    ($ExecuteFormatString,$SystemMemoryLimit,$Format,$Transform) = 
+    ($SystemInfo =~ /\Q$System\E *=> *([^;]*); *([^;]*); *([^;]*); *([^;]*);/);
+
+#----Check for system specific memory limit
+    if ($SystemMemoryLimit =~ /\d+/) {
+        $MemoryLimit = $SystemMemoryLimit * 1024 * 1024;
+    }
+
+#----Replace default values with any specified
+    QuietPrint($QuietFlag,2,"${System}'s non-default parameters being retrieved");
+    while (defined($FlagsTimeAndProblems[0]) && ($FlagsTimeAndProblems[0] =~
+/^-[ftx]$/) && defined($FlagsTimeAndProblems[1])) {
+        $OptionalFlag = shift(@FlagsTimeAndProblems);
+        $OptionalFlagValue = shift(@FlagsTimeAndProblems);
+        QuietPrint($QuietFlag,2,"\n    $OptionalFlag $OptionalFlagValue");
+        if ($OptionalFlag eq "-f") {
+            NoNastyUNIX($OptionalFlagValue);
+            $Format = $OptionalFlagValue;
+        }
+        if ($OptionalFlag eq "-t") {
+            NoNastyUNIX($OptionalFlagValue);
+            $Transform = $OptionalFlagValue;
+        }
+        if ($OptionalFlag eq "-x") {
+#----Do not allow binary name to be changed (hack prevention)
+            ($OldBinary) = ($ExecuteFormatString =~ /^([^ ]*)/);
+            ($NewArgs) = ($OptionalFlagValue =~ /^[^ ]* (.*)/);
+            NoNastyUNIX($NewArgs);
+            $ExecuteFormatString = "$OldBinary $NewArgs";
+        }
+    }
+    QuietPrint($QuietFlag,2,"\n");
+
+#----Check the system executable
+    QuietPrint($QuietFlag,0,"$System   being checked for execution\n");
+
+#----Split system executable name from its parameters
+    ($SystemExecutable,$SystemParameters) = ($ExecuteFormatString =~ /^([^ ]*) *(.*)/);
+#----Add directory onto front of system executable, and check it is executable
+    if ($SystemExecutable !~ /^\//) {
+        $SystemExecutable = "$SystemsDirectory/$System/$SystemExecutable";
+    }
+    if (!(-x $SystemExecutable)) {
+        system("rm -rf $TemporaryDirectory\n");
+        die("ERROR $SystemExecutable is not executable\n");
+    }
+#----Rebuild the command format string
+    $ExecuteFormatString = "$SystemExecutable $SystemParameters";
+
+#----Check the time limit
+    if (defined($TimeLimit = shift(@FlagsTimeAndProblems))) {
+        QuietPrint($QuietFlag,0,"$System   checking time limit $TimeLimit\n");
+        if ($TimeLimit !~ /^-?\d+$/ || $TimeLimit > $MaximalTimeLimit) {
+            system("rm -rf $TemporaryDirectory\n");
+            die("ERROR: $TimeLimit is outside the time limit range $MaximalTimeLimit\n");
+        } 
+        $WCTimeLimit = $TimeLimit * $CPUWCLimitScaleFactor;
+    } else {
+        system("rm -rf $TemporaryDirectory\n");
+        die("ERROR: No time limit given\n");
+    }
+
+#----See if an explicit wall clock time limit is given
+    if (scalar(@FlagsTimeAndProblems) > 1 && $FlagsTimeAndProblems[0] eq "-w") {
+        shift(@FlagsTimeAndProblems);
+        $WCTimeLimit = shift(@FlagsTimeAndProblems);
+        if ($MemoryLimit !~ /^\d+$/ || $MemoryLimit < 0) {
+            system("rm -rf $TemporaryDirectory\n");
+            die("ERROR: Wall clock limit $WCTimeLimit is weird\n");
+        }
+    } 
+
+#----See if a memory limit has been given
+    if (scalar(@FlagsTimeAndProblems) > 1 && $FlagsTimeAndProblems[0] eq "-m") {
+        shift(@FlagsTimeAndProblems);
+        $MemoryLimit = shift(@FlagsTimeAndProblems);
+        if ($MemoryLimit !~ /^\d+$/ || $MemoryLimit < 0) {
+            system("rm -rf $TemporaryDirectory\n");
+            die("ERROR: Memory limit $MemoryLimit is weird\n");
+        }
+        $MemoryLimit *= (1024*1024);
+    } 
+
+#----See if a nice value has been given
+    if (scalar(@FlagsTimeAndProblems) > 1 && $FlagsTimeAndProblems[0] eq "-n") {
+        shift(@FlagsTimeAndProblems);
+        $NiceValue = shift(@FlagsTimeAndProblems);
+        if ($NiceValue !~ /^[\d-]+$/) {
+            system("rm -rf $TemporaryDirectory\n");
+            die("ERROR: Nice value $NiceValue is weird\n");
+        }
+    } 
+
+#----See if X2tptp postprocessing is required
+    if (scalar(@FlagsTimeAndProblems) > 0 && $FlagsTimeAndProblems[0] eq "-S") {
+#----Suppress for tptp[24]X
+        if ($System =~ /^tptp[24]X/) {
+            $UseX2tptp = 0;
+        } else {
+            $UseX2tptp = 1;
+        }
+        shift(@FlagsTimeAndProblems);
+    } else {
+        $UseX2tptp = 0;
+    }
+
+#----Get the problem files list
+    $NeedFormatter = 0;
+    $NeedOtter2TPTP = 0;
+#----See if they are listed in a file
+    if ($FlagsTimeAndProblems[0] eq "-l" || $FlagsTimeAndProblems[0] eq "-L") {
+        if (defined($ProblemListFile = $FlagsTimeAndProblems[1]) && -r $ProblemListFile) {
+#----Note if formatter is needed -l => yes, -L => no
+            $NeedFormatter = $FlagsTimeAndProblems[0] eq "-l";
+#----Read them all
+            NoNastyUNIX($ProblemListFile);
+            open($ProblemListHandle,"<$ProblemListFile") ||
+die("ERROR: Cannot read $ProblemListFile\n");
+            QuietPrint($QuietFlag,0,"$System   getting problem list\n");
+            @FlagsTimeAndProblems = ();
+            while (defined($ProblemFile = <$ProblemListHandle>)) {
+                chomp($ProblemFile);
+#For lists with following crap $ProblemFile =~ s/ .*//;
+                push(@FlagsTimeAndProblems,("$ProblemFile"));
+                }
+            close($ProblemListHandle);
+        } else {
+            system("rm -rf $TemporaryDirectory\n");
+            die("ERROR: Problem list file missing or unreadable\n");
+        }
+#----Otherwise the files have been listed directly
+#----Check if already formatted
+    } elsif ($FlagsTimeAndProblems[0] eq "-F") {
+        $NeedFormatter = 0;
+        shift(@FlagsTimeAndProblems);
+#----Otter format input
+    } elsif ($FlagsTimeAndProblems[0] eq "-O") {
+        $NeedOtter2TPTP = 1;
+        $NeedFormatter = 1;
+        shift(@FlagsTimeAndProblems);
+    } else {
+        $NeedFormatter = 1;
+    }
+
+#----Go through each one and check it's reasonable
+    foreach $ProblemFile (@FlagsTimeAndProblems) {
+        QuietPrint($QuietFlag,0,"$System   checking problem name $ProblemFile\n");
+        if (!(-r "$ProblemFile")) {
+#----Check reading STDIN
+            if ($ProblemFile eq "--") {
+                $Problem = "stdin";
+                ($TempHandle,$ProblemFile) = 
+mkstemp("$TemporaryDirectory/STDIN_XXXXXX");
+                while (defined($Line = <STDIN>)) {
+                    print($TempHandle $Line);
+                }
+                close($TempHandle);
+#----If it looks like a TPTP, let tptp?X find it
+            } else {
+#----Extract base file name
+                NoNastyUNIX($ProblemFile);
+                $Problem = `basename '$ProblemFile' '\\.[a-z]*'`;
+                chomp($Problem);
+                if ($Problem =~ 
+/^[A-Z]{3}[0-9]{3}[+-^=_][1-9][0-9]*(\.[0-9]{3}(\.[0-9]{3})*)?$/) {
+                    $ProblemFile = $Problem;
+#----Otherwise not a real problem
+                } else {
+                    system("rm -rf $TemporaryDirectory\n");
+                    print("ERROR: $ProblemFile is not readable or TPTP-like\n");
+                    die("\n");
+                }
+            }
+        }
+        push(@ProblemFiles,($ProblemFile));
+    }
+
+#----Check for a negative time limit, in which case only postprocess
+    if ($TimeLimit < 0) {
+        $NeedOtter2TPTP = 0;
+        $NeedFormatter = 0;
+        $UsingSoTFlag = "";
+        $ExecuteFormatString = $CatEchoCommand;
+    } else {
+        $UsingSoTFlag = "-sot";
+    }
+
+#----Return the valid information
+    return($ExecuteFormatString,$Format,$Transform,$TimeLimit,$WCTimeLimit,$MemoryLimit,$NiceValue,
+$NeedFormatter,$NeedOtter2TPTP,$UseX2tptp,$UsingSoTFlag,@ProblemFiles);
+}
+#--------------------------------------------------------------------------------------------------
+sub ConvertFromOtter {
+    my ($QuietFlag,$TemporaryDirectory,@ProblemFiles) = @_;
+
+    my $InputFile;
+    my $OutputFile;
+    my @OutputFiles;
+    my $Basename;
+
+    foreach $InputFile (@ProblemFiles) {
+        QuietPrint($QuietFlag,2,"Converting $InputFile from Otter to TSTP\n");
+        NoNastyUNIX($InputFile);
+        $Basename = `basename '$InputFile'`;
+        chomp($Basename);
+        $OutputFile = "$TemporaryDirectory/$Basename";
+        system("$Otter2TPTPCommand < $InputFile > $OutputFile");
+        push(@OutputFiles,($OutputFile));
+    }
+
+    return(@OutputFiles);
+}
+#--------------------------------------------------------------------------------------------------
+sub PrepareProblems {
+    my ($QuietFlag,$TemporaryDirectory,$System,$Transform,$Format,@ProblemFiles) = @_;
+
+    my $ProblemFileHandle = "ProblemFileHandle";
+    my $PPCHandle = "PPCHandle";
+    my @PPCs;
+    my $CantFormatFile;
+    my $ProblemFileLine;
+    my $Problem;
+    my $ProblemFile;
+    my $FileNamesArgument;
+    my $NumberOfFilesThisTime;
+    my @ErrorLines;
+    my @ProblemFilesThisTime;
+    my @FormatterOutput;
+    my $FormatterLine;
+    my $FormatterInputFile;
+    my $FormatterOutputFile;
+    my @FormatterOutputFiles;
+    my $TPTPStyleOutputFile;
+    my $ExtraTPTP4XFlags;
+
+#----Load the list of preparation constraints
+    if (open($PPCHandle,"<$PPCFilename")) {
+        @PPCs = <$PPCHandle>;
+        close($PPCHandle);
+    } else {
+        print("WARNING: No $PPCFilename\n");
+        @PPCs = ();
+    }
+    $CantFormatFile = "$TemporaryDirectory/CantFormatFile";
+
+    @FormatterOutputFiles = ();
+    while (@ProblemFiles) {
+        @ProblemFilesThisTime = ();
+        $NumberOfFilesThisTime = 0;
+        @FormatterOutput = ();
+        while ($#ProblemFilesThisTime < 100 && @ProblemFiles) {
+            $ProblemFile = shift(@ProblemFiles);
+            NoNastyUNIX($ProblemFile);
+            $Problem = `basename '$ProblemFile' .p`;
+            chomp($Problem);
+#----Print the TPTP format file if available
+            if (QuietPrintCheck($QuietFlag,0)) {
+                NoNastyUNIX($ProblemFile);
+                if (open($ProblemFileHandle,"<$ProblemFile")) {
+                    QuietPrint($QuietFlag,0,"\n${System}'s TPTP format $ProblemFile is ...\n");
+                    while(defined($ProblemFileLine = <$ProblemFileHandle>)) {
+                        QuietPrint($QuietFlag,0,"$ProblemFileLine");
+                    }
+                    QuietPrint($QuietFlag,0,"\n");
+                    close($ProblemFileHandle);
+                } else {
+                    QuietPrint($QuietFlag,0,
+"${System}'s file $ProblemFile not found, but maybe the formatter will\n");
+                }
+            }
+#----Check if formatter will cope
+            if (!FormatterCanCope($Problem,$Format,$Transform,@PPCs)) {
+                QuietPrint($QuietFlag,1,"${System}'s format not available for $Problem\n");
+                open($ProblemFileHandle,">> $CantFormatFile") or
+die("ERROR: Cannot append to $CantFormatFile\n");
+                print($ProblemFileHandle "ERROR: Cannot format $Problem\n");
+                close($ProblemFileHandle);
+                push(@FormatterOutputFiles,("$ProblemFile -> $CantFormatFile"));
+                QuietPrint($QuietFlag,0,"$System   will use $CantFormatFile\n");
+            } else {
+#----Avoid adding a leading space
+                push(@ProblemFilesThisTime,($ProblemFile));
+                $NumberOfFilesThisTime++;
+            }
+        }
+#DEBUG print("About to prepare $NumberOfFilesThisTime problems\n");
+#DEBUG print("They are ... @ProblemFilesThisTime\n");
+
+#----Check if any work to be done
+        if ($NumberOfFilesThisTime == 0) {
+            if (open($ProblemFileHandle,"<$CantFormatFile")) {
+                if (QuietPrintCheck($QuietFlag,0)) {
+                    QuietPrint($QuietFlag,0,
+"${System}'s can't format source file is ...\n");
+                    while(defined($ProblemFileLine = <$ProblemFileHandle>)) {
+                        QuietPrint($QuietFlag,0,"$ProblemFileLine");
+                    }
+                }
+                close($ProblemFileHandle);
+            } else {
+                die("ERROR: $CantFormatFile cannot be opened\n");
+            }
+        } else {
+#----If tptp:raw format and all readable files, do nothing
+            if ($Format =~ /.*:raw/ && $Transform eq "none" && 
+AllReadableFiles(@ProblemFilesThisTime)) {
+                QuietPrint($QuietFlag,2,"${System}'s $Problem does not need preparation\n");
+                foreach $ProblemFile (@ProblemFilesThisTime) {
+                    push(@FormatterOutput,("$ProblemFile -> $ProblemFile\n"));
+                }
+#----If no transform and tptp format, use tptp4X, else use tptp2X
+            } elsif (TPTP4XCanDo($System,$Transform,$Format,@ProblemFilesThisTime)) {
+                $ExtraTPTP4XFlags = GetExtraTPTP4XFlags($System);
+#----Print the tptp4X parameters
+                QuietPrint($QuietFlag,2,"${System}'s $Problem being prepared by $tptp4XCommand\n");
+                QuietPrint($QuietFlag,2,"    -d $TemporaryDirectory " .
+    ( $ExtraTPTP4XFlags eq "" ? "" : "\n$ExtraTPTP4XFlags") . "
+    -t $Transform 
+    -f $Format
+    -x 
+    -u machine
+    @ProblemFilesThisTime\n");
+                @FormatterOutput = DoTPTP4X($TemporaryDirectory,$ExtraTPTP4XFlags,$Transform,
+$Format,@ProblemFilesThisTime);
+            } else {
+#----Print the tptp2X parameters
+                QuietPrint($QuietFlag,2,"${System}'s $Problem being prepared by $tptp2XCommand\n");
+                QuietPrint($QuietFlag,2,"    -d $TemporaryDirectory 
+    -t $Transform 
+    -f $Format
+    @ProblemFilesThisTime\n");
+#----Run tptp2X and extract the output file name
+                @FormatterOutput = DoTPTP2X($TemporaryDirectory,$Transform,$Format,
+@ProblemFilesThisTime);
+            }
+
+#DEBUG print("Reformatter said\n====@FormatterOutput====\n");
+#----Look for errors in output
+            @ErrorLines = grep(m|ERROR:|,@FormatterOutput);
+            if (scalar(@ErrorLines) > 0) {
+                @FormatterOutput = ();
+            } else {
+                @FormatterOutput = grep(m| -> |,@FormatterOutput);
+            }
+#DEBUG print("Need $NumberOfFilesThisTime lines in \n@FormatterOutput\n");
+
+#----Extract the output file names
+            if ($NumberOfFilesThisTime > scalar(@FormatterOutput)) {
+                print("ERROR: Formatter did not create all the $System format files\n");
+                if (scalar(@ErrorLines) > 0) {
+                    print(@ErrorLines);
+                } else {
+                    print("       (Possibly the problem does not exist)\n");
+                    print("       (Possibly the \"$Format\" format module is currently unavailable)\n");
+                }
+                die("\n");
+            }
+            foreach $FormatterLine (@FormatterOutput) {
+                chomp($FormatterLine);
+                ($FormatterInputFile,$FormatterOutputFile) = ($FormatterLine =~ / *(.*) -> (.*)/);
+
+#----If a .tptp file, revert to .p for IDIOT systems like E-SETHEO
+#                if ($FormatterOutputFile =~ /\.tptp$/) {
+#                    $TPTPStyleOutputFile = $FormatterOutputFile;
+#                    $TPTPStyleOutputFile =~ s/tptp$/p/;
+#                    system("mv $FormatterOutputFile $TPTPStyleOutputFile");
+#                    $FormatterOutputFile = $TPTPStyleOutputFile;
+#                }
+
+#----Check the output file exists and can be read
+                QuietPrint($QuietFlag,0,"$System   will use $FormatterOutputFile\n");
+                NoNastyUNIX($FormatterOutputFile);
+                if (open($ProblemFileHandle,"<$FormatterOutputFile")) {
+                    if (QuietPrintCheck($QuietFlag,0)) {
+                        QuietPrint($QuietFlag,0,"${System}'s own format source file is ...\n");
+                        while(defined($ProblemFileLine = <$ProblemFileHandle>)) {
+                            QuietPrint($QuietFlag,0,"$ProblemFileLine");
+                        }
+                        QuietPrint($QuietFlag,0,"\n");
+                    }
+                    close($ProblemFileHandle);
+                } else {
+                    die("ERROR: Formatter output $FormatterOutputFile not found\n");
+                }
+
+#----Add this one to the list
+#DEBUG print("Adding $FormatterInputFile -> $FormatterOutputFile to list\n");
+                push(@FormatterOutputFiles,("$FormatterInputFile -> $FormatterOutputFile"));
+#DEBUG print("List is now @FormatterOutputFiles\n");
+            }
+        }
+    }
+
+    return(@FormatterOutputFiles);
+} 
+#--------------------------------------------------------------------------------------------------
+sub FormatterCanCope {
+    my ($Problem,$SystemFormat,$SystemTransform,@PPCs) = @_;
+
+    my @ProblemLines;
+    my $ProblemLine;
+    my $PPCFormat;
+    my $PPCTransform;
+
+    @ProblemLines = grep(/^\Q$Problem\E /,@PPCs);
+    if (scalar(@ProblemLines) > 0) {
+        foreach $ProblemLine (@ProblemLines) {
+            chomp($ProblemLine);
+            ($PPCFormat,$PPCTransform) = ($ProblemLine =~ /^\Q$Problem\E +([^ ]+) +([^ ]+)/);
+            if (
+#----Format constraints
+($PPCFormat eq "*" || $PPCFormat eq $SystemFormat || 
+#----Allow tptp variants - tptp:raw, oldtptp, tptp:short, tptp:long
+($PPCFormat eq "tptp" && $SystemFormat =~ /tptp/)) &&
+#----Transform constraints
+($PPCTransform eq "*" || $PPCTransform eq $SystemTransform)) {
+                return(1);
+            }
+        }
+#----None of the options match the system requirements
+        return(0);
+    } else {
+        return(1);
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub CreateExecuteString {
+
+    my ($ExecuteFormatString,$ProblemFileName,$TimeLimit) = @_;
+
+    my $ExecuteString;
+
+    SWITCH: {
+        if ($ExecuteFormatString =~ /%s.*%d/) {
+            $ExecuteString = sprintf($ExecuteFormatString,$ProblemFileName,
+$TimeLimit);
+            last SWITCH;
+        }
+        if ($ExecuteFormatString =~ /%d.*%s/) {
+            $ExecuteString = sprintf($ExecuteFormatString,$TimeLimit,
+$ProblemFileName);
+            last SWITCH;
+        }
+        if ($ExecuteFormatString =~ /%s/) {
+            $ExecuteString = sprintf($ExecuteFormatString,$ProblemFileName);
+            last SWITCH;
+        }
+        $ExecuteString = $ExecuteFormatString;
+    }
+
+    return($ExecuteString);
+}
+#--------------------------------------------------------------------------------------------------
+sub StatusFromSystemOutput {
+    my ($QuietFlag,$SystemFileHandle,$System,$TimeLimit,$WCTimeLimit) = @_;
+
+    my @SystemInfos;
+    my $SystemInfo;
+    my $SolvedString;
+    my $SolvedType;
+    my @SolvedStrings;
+    my %SolvedStrings;
+    my $NotSolvedString;
+    my $NotSolvedType;
+    my @NotSolvedStrings;
+    my %NotSolvedStrings;
+    my $StartSolnString;
+    my $StartSolnType;
+    my @StartSolnStrings;
+    my %StartSolnStrings;
+    my $EndSolnString;
+    my $EndSolnType;
+    my @EndSolnStrings;
+    my %EndSolnStrings;
+    my $ProblemSolved;
+    my $SystemOutputLine;
+    my $SystemPart;
+    my $Status;
+    my $LineCPUTime;
+    my $LineRealTime;
+    my $CPUTime;
+    my $RealTime;
+    my $OutputStatus;
+    my $OutputCPUTime;
+    my $OutputRealTime;
+    my @StatisticValues;
+    my $StatisticValues;
+    my %StatisticValues;
+    my $StatisticSpec;
+    my @StatisticSpecs;
+    my $StatisticName;
+    my $StatisticRegexp;
+    my @StatisticNames;
+    my %StatisticRegexps;
+
+#----Get strings to look for
+    NoNastyUNIX("$GetSystemInfoCommand Solved NotSolved StartSoln EndSoln Statistic");
+    (@SystemInfos) = grep(/^\Q$System\E *=>/,
+`$GetSystemInfoCommand Solved NotSolved StartSoln EndSoln Statistic`);
+    if (scalar(@SystemInfos) != 1) {
+        die("ERROR: Not one line of information for $System\n");
+    }
+    $SystemInfo = $SystemInfos[0];
+    chomp($SystemInfo);
+    ($SolvedString,$NotSolvedString,$StartSolnString,$EndSolnString,
+$StatisticSpec) = ($SystemInfo =~ 
+/\Q$System\E *=> *([^;]*); *([^;]*); *([^;]*); *([^;]*); *([^;]*);/);
+
+#----Sort out solved strings
+    if ($SolvedString ne "NO INFORMATION") {
+        @SolvedStrings = split(/ && /,$SolvedString);
+        foreach $SolvedString (@SolvedStrings) {
+            ($SolvedType,$SolvedString) = ($SolvedString =~ /([^ ]*) = (.*)/);
+            $SolvedStrings{$SolvedType} = $SolvedString;
+        }
+    }
+#----Sort out not solved strings
+    if ($NotSolvedString ne "NO INFORMATION") {
+        @NotSolvedStrings = split(/ && /,$NotSolvedString);
+        foreach $NotSolvedString (@NotSolvedStrings) {
+            ($NotSolvedType,$NotSolvedString) = 
+($NotSolvedString =~ /([^ ]*) = (.*)/);
+            $NotSolvedStrings{$NotSolvedType} = $NotSolvedString;
+        }
+    }
+#----Sort out start solution strings
+    if ($StartSolnString ne "NO INFORMATION") {
+        @StartSolnStrings = split(/ && /,$StartSolnString);
+        foreach $StartSolnString (@StartSolnStrings) {
+            ($StartSolnType,$StartSolnString) = 
+($StartSolnString =~ /([^ ]*) = (.*)/);
+            $StartSolnStrings{$StartSolnType} = $StartSolnString;
+        }
+    }
+#----Sort out end solution strings
+    if ($EndSolnString ne "NO INFORMATION") {
+        @EndSolnStrings = split(/ && /,$EndSolnString);
+        foreach $EndSolnString (@EndSolnStrings) {
+            ($EndSolnType,$EndSolnString) = 
+($EndSolnString =~ /([^ ]*) = (.*)/);
+            $EndSolnStrings{$EndSolnType} = $EndSolnString;
+        }
+    }
+#----Sort out statistic specs
+    if ($StatisticSpec ne "NO INFORMATION") {
+        @StatisticSpecs = split(/ && /,$StatisticSpec);
+        foreach $StatisticSpec (@StatisticSpecs) {
+            ($StatisticName,$StatisticRegexp) = 
+($StatisticSpec =~ /([^ ]*) = (.*)/);
+            @StatisticNames = (@StatisticNames,$StatisticName);
+            $StatisticRegexps{$StatisticName} = $StatisticRegexp;
+        }
+    }
+
+#----Read system output to try find a result status
+    $ProblemSolved = 0;
+    $Status = $UnknownStatus;
+    $CPUTime = 0;
+    $RealTime = 0;
+    $OutputStatus = $NoneStatus;
+    $OutputCPUTime = 0;
+    $OutputRealTime = 0;
+    undef($EndSolnType);
+
+    QuietPrint($QuietFlag,1,"% START OF SYSTEM OUTPUT\n");
+    while(defined($SystemOutputLine = <$SystemFileHandle>)) {
+        if ($SystemOutputLine =~ /^ERROR:/) {
+            die("$SystemOutputLine");
+        }
+#----Extract the times from the line
+#DEBUG print("Dirty line ===$SystemOutputLine===\n");
+        ($LineCPUTime,$LineRealTime) = ($SystemOutputLine =~ /^([0-9\.]*)\/([0-9\.]*)\t/);
+#DEBUG print("Extracted times $LineCPUTime,$LineRealTime\n");
+        $SystemOutputLine =~ s/^[^\t]*\t//;
+#DEBUG print("Cleaned line ===$SystemOutputLine===\n");
+#----Only check output if not interrupted
+        if (!$GlobalInterruptedInLib) {
+            if ($Status eq $UnknownStatus) {
+                foreach $SolvedType (keys(%SolvedStrings)) {
+#----Note lack of \Q \E here so regexp can be used. Beware!
+                    if ($SolvedStrings{$SolvedType} eq "StartOfFile" ||
+$SystemOutputLine =~ /$SolvedStrings{$SolvedType}/) {
+                        $Status = $SolvedType;
+#----At least an assurance
+                        if ($OutputStatus eq $NoneStatus) {
+                            $OutputStatus = $AssuranceStatus;
+                            $OutputCPUTime = $LineCPUTime;
+                            $OutputRealTime = $LineRealTime;
+                        }
+                        $CPUTime = $LineCPUTime;
+                        $RealTime = $LineRealTime;
+                        $ProblemSolved = 1;
+                        last;
+                    }
+                }
+                foreach $NotSolvedType (keys(%NotSolvedStrings)) {
+#----Note lack of \Q \E here so regexp can be used. Beware!
+                    if ($SystemOutputLine =~ /$NotSolvedStrings{$NotSolvedType}/) {
+                        $Status = $NotSolvedType;
+#----At least an assurance
+                        $OutputStatus = $NoneStatus;
+                        $OutputCPUTime = $LineCPUTime;
+                        $OutputRealTime = $LineRealTime;
+                        $CPUTime = $LineCPUTime;
+                        $RealTime = $LineRealTime;
+                        $ProblemSolved = 1;
+                        last;
+                    }
+                }
+            }
+
+#----Check if start of solution string is there, if no previous
+#----solution started
+            if (!defined($EndSolnType)) {
+                foreach $StartSolnType (keys(%StartSolnStrings)) {
+#DEBUG print("Look for $StartSolnStrings{$StartSolnType} in $SystemOutputLine\n");
+                    if ((exists($StartSolnStrings{$StartSolnType}) &&
+$StartSolnStrings{$StartSolnType} eq "StartOfFile") ||
+$SystemOutputLine =~ /\Q$StartSolnStrings{$StartSolnType}\E/) {
+                        $EndSolnType = $StartSolnType;
+                        last;
+                    }
+                }
+            }
+#----Check if end of solution string is there
+#DEBUG print("Look for $EndSolnStrings{$StartSolnType} in $SystemOutputLine\n");
+            if (defined($EndSolnType) &&
+$SystemOutputLine =~ /\Q$EndSolnStrings{$EndSolnType}\E/) {
+                $OutputStatus = $EndSolnType;
+                $OutputCPUTime = $LineCPUTime;
+                $OutputRealTime = $LineRealTime;
+            }
+
+#----Check for last times
+#DEBUG print("In SfSO ==$Status==$UnknownStatus==$SystemOutputLine==\n");
+#----If accepting until end of file, catch that here
+            if (defined($EndSolnType) &&
+$EndSolnStrings{$EndSolnType} eq "EndOfFile" && $SystemOutputLine =~ /^EOF$/) {
+                $OutputStatus = $EndSolnType;
+                $OutputCPUTime = $LineCPUTime;
+                $OutputRealTime = $LineRealTime;
+            }
+            if ($Status eq $UnknownStatus && $SystemOutputLine =~ /^EOF$/) {
+                $CPUTime = $LineCPUTime;
+                $RealTime = $LineRealTime;
+            }
+
+#----Check for statistic values
+            foreach $StatisticName (@StatisticNames) {
+                if ($SystemOutputLine =~ /$StatisticRegexps{$StatisticName}/) {
+                    ($StatisticValues{$StatisticName}) = 
+($SystemOutputLine =~ /$StatisticRegexps{$StatisticName}/);
+                    if ($StatisticValues{$StatisticName} =~ / /) {
+                        $StatisticValues{$StatisticName} = 
+"'$StatisticValues{$StatisticName}'";
+                   }
+                }
+            }
+            if ($SystemOutputLine !~ /^EOF$/) {
+                QuietPrint($QuietFlag,1,"$SystemOutputLine");
+            }
+        } else {
+#----Print line anyway if global interrupted, and waiting for system to end
+            if ($SystemOutputLine !~ /^EOF$/) {
+                QuietPrint($QuietFlag,0,"$SystemOutputLine");
+            }
+        }
+    }
+    QuietPrint($QuietFlag,1,"\n% END OF SYSTEM OUTPUT\n");
+
+#----Check if a solution was output, but no solution claimed to be found
+    if (!$ProblemSolved && $OutputStatus ne $NoneStatus) {
+        QuietPrint($QuietFlag,1,"% WARNING: Not solved but solution found\n");
+        $OutputStatus = $NoneStatus;
+        $OutputCPUTime = 0;
+        $OutputRealTime = 0;
+        undef($EndSolnType);
+    }
+
+#----If the time taken is greater than the limit, then timeout
+    if ($CPUTime > $TimeLimit || (!$ProblemSolved && 
+$CPUTime * $NotSolvedCPUTimeScale > $TimeLimit)) {
+        $Status = $TimeoutStatus;
+#----If system gave up because it thought time out, fix the time taken
+        if ($CPUTime < $TimeLimit) {
+            $CPUTime = $TimeLimit;
+        }
+#----Don't adjust real time - can be less due to multicore processing
+#        if ($RealTime < $TimeLimit) {
+#            $RealTime = $TimeLimit;
+#        }
+#----No output accepted if timed out
+        $OutputStatus = $NoneStatus;
+        $OutputCPUTime = 0;
+        $OutputRealTime = 0;
+        undef($EndSolnType);
+    }
+
+#----If the time taken is greater than the limit, then timeout
+    if ($RealTime > $WCTimeLimit || (!$ProblemSolved && 
+$RealTime * $NotSolvedCPUTimeScale > $WCTimeLimit)) {
+        $Status = $TimeoutStatus;
+#----If system gave up because it thought time out, fix the time taken
+        if ($RealTime < $WCTimeLimit) {
+            $RealTime = $WCTimeLimit;
+        }
+#----No output accepted if timed out
+        $OutputStatus = $NoneStatus;
+        $OutputCPUTime = 0;
+        $OutputRealTime = 0;
+        undef($EndSolnType);
+    }
+
+#----Make stats output line
+    $StatisticValues = "";
+    foreach $StatisticName (@StatisticNames) {
+        if (exists($StatisticValues{$StatisticName})) {
+            if (QuietLevelFromFlag($QuietFlag) <= 2) {
+                $StatisticValues = 
+"$StatisticValues $StatisticName = $StatisticValues{$StatisticName}";
+            } else {
+                $StatisticValues = 
+"$StatisticValues $StatisticValues{$StatisticName}";
+            }
+        }
+    }
+
+    return($Status,$CPUTime,$RealTime,$OutputStatus,$OutputCPUTime,
+$OutputRealTime,$StatisticValues);
+}
+#--------------------------------------------------------------------------------------------------
+sub FixFOFResult {
+    my ($Status,$FileName) = @_;
+
+    my $ConjectureLines;
+
+    NoNastyUNIX($FileName);
+    if ($Status eq "Unsatisfiable" || $Status eq "Satisfiable" || 
+$Status eq "Theorem" || $Status eq "CounterSatisfiable") {
+        $ConjectureLines = 
+`$GrepCommand -c '^ *input_formula(.*, *conjecture *,' '$FileName'` + 
+#----Match fof, tff, thf, qmf; match for conjecture, question conjecture-local, conjecture-global
+`$GrepCommand -c -E '^ *[ftq][omfh]f\\(.*, *(conjecture|question)(-(local|global))? *,' '$FileName'` +
+`$GrepCommand -c 'This is the conjecture' '$FileName'`;
+#DEBUG system("cat $FileName");
+#DEBUG print("ConjectureLines $ConjectureLines  Status $Status\n");
+        if ($ConjectureLines > 0) {
+            if ($Status eq "Unsatisfiable") {
+                return("Theorem");
+            }
+            if ($Status eq "Satisfiable") {
+                return("CounterSatisfiable");
+            }
+        } else {
+            if ($Status eq "Theorem") {
+                return("Unsatisfiable");
+            }
+            if ($Status eq "CounterSatisfiable") {
+                return("Satisfiable");
+            }
+        }
+    }
+    return($Status);
+}
+#--------------------------------------------------------------------------------------------------
+sub ExtractTime {
+    my $TimeLine = $_[0];
+    my $TimeType = $_[1];
+
+    my $Hours;
+    my $Minutes;
+    my $Seconds;
+    my $Tenths;
+
+#----Try extract a time with hours
+    ($Hours,$Minutes,$Seconds,$Tenths) =
+    ($TimeLine  =~ /^$TimeType *([0-9]+):([0-9]+):([0-9]+)\.([0-9])/);
+#----If no hours, extract with minutes
+    if (!defined($Hours)) {
+        $Hours = 0;
+        ($Minutes,$Seconds,$Tenths) =
+($TimeLine  =~ /^$TimeType *([0-9]+):([0-9]+)\.([0-9])/);
+    }
+#----If no minutes, extract with seconds (always there)
+    if (!defined($Minutes)) {
+        $Minutes = 0;
+        ($Seconds,$Tenths) = ($TimeLine  =~ /^$TimeType *([0-9]+)\.([0-9])/);
+    }
+
+#----If no seconds, then undefined
+    if (!defined($Seconds)) {
+        return(undef);
+    } else {
+#----Compute final time in seconds
+        return($Hours * 3600 + $Minutes * 60 + $Seconds + $Tenths/10);
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub ReportResult {
+    my ($QuietFlag,$Prefix,$System,$Problem,$Status,$CPUTime,$RealTime,
+$StatisticValues) = @_;
+
+#----Must do these in a single print, for multiple copies writing up a pipe,
+#----as used by SSCPA
+
+#----If asking for only system output, put RESULT as comment. This is a HACK!
+    if ($QuietFlag eq "-q01") {
+        $Prefix = "% $Prefix";
+        $QuietFlag = 1;
+    }
+    if (QuietPrintCheck($QuietFlag,2)) {
+        print("$Prefix $Problem - $System says $Status - CPU = $CPUTime WC = $RealTime $StatisticValues\n");
+    } else {
+        if (QuietPrintCheck($QuietFlag,3)) {
+            print("$Problem $Status $CPUTime $RealTime $StatisticValues\n");
+        }
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub QuietPrint {
+    my ($QuietFlag,$QuietCeiling,$OutputString) = @_;
+
+#----Only print if the $QuietFlag <= $QuietCeiling
+    if ($OutputString =~ /!!!/ || QuietPrintCheck($QuietFlag,$QuietCeiling)) {
+        print($OutputString);
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub QuietPrintCheck {
+    my ($QuietFlag,$QuietCeiling) = @_;
+
+    my $QuietLevel;
+
+    $QuietLevel = QuietLevelFromFlag($QuietFlag);
+
+    return(($QuietFlag =~ /-q0\d+/ && $QuietLevel == $QuietCeiling) ||
+($QuietFlag !~ /-q0\d+/ && $QuietLevel <= $QuietCeiling));
+}
+#--------------------------------------------------------------------------------------------------
+sub QuietLevelFromFlag {
+
+    my ($QuietFlag) = @_;
+
+    my $QuietLevel;
+
+#----Extract the quietness level
+    if ($QuietFlag =~ /-q\d+/) {
+        ($QuietLevel) = ($QuietFlag =~ /-q0*(\d+)/);
+    } else {
+        $QuietLevel = 0;
+    }
+
+    return($QuietLevel);
+}
+#--------------------------------------------------------------------------------------------------
+sub NoNastyUNIX {
+    my ($ToBeClean) = @_;
+
+#----These lines added to prevent the pipe hack
+    if ($ToBeClean =~ /[`\|;\&<>]/) {
+        print("Illegal character in $ToBeClean\n");
+        die("Illegal character in $ToBeClean\n");
+    }
+    if ($ToBeClean =~ /\.\.\//) {
+        print("Illegal path in $ToBeClean\n");
+        die("Illegal path in $ToBeClean\n");
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub AllReadableFiles {
+    my (@ProblemFiles) = @_;
+
+    while (scalar(@ProblemFiles) >= 1) {
+        if (! -f $ProblemFiles[0]) {
+            return(0);
+        }
+        shift(@ProblemFiles);
+    }
+    return(1);
+}
+#--------------------------------------------------------------------------------------------------
+sub DoTPTP2X {
+    my ($TemporaryDirectory,$Transform,$Format,@ProblemFiles) = @_;
+
+    my $ProblemFiles;
+    my $ProblemFile;
+
+    NoNastyUNIX("$tptp2XCommand -d $TemporaryDirectory -t '$Transform' -f '$Format' @ProblemFiles");
+    $ProblemFiles = "";
+    foreach $ProblemFile (@ProblemFiles) {
+        $ProblemFiles .= "'$ProblemFile' ";
+    }
+    return(`$tptp2XCommand -d $TemporaryDirectory -t '$Transform' -f '$Format' $ProblemFiles 2>&1 | cat`);
+}
+#--------------------------------------------------------------------------------------------------
+sub DoTPTP4X {
+    my ($TemporaryDirectory,$ExtraTPTP4XFlags,$Transform,$Format,@ProblemFiles) = @_;
+
+    my $ExpandFlag;
+    my $ProblemFiles;
+    my $ProblemFile;
+
+    NoNastyUNIX("$tptp4XCommand $ExtraTPTP4XFlags -d $TemporaryDirectory -t '$Transform' -f '$Format' -x -u machine @ProblemFiles");
+    if ($Format eq "tptp:raw") {
+        $ExpandFlag = "";
+        $Format = "tptp";
+    } else {
+        $ExpandFlag = "-x";
+    }
+    $ProblemFiles = "";
+    foreach $ProblemFile (@ProblemFiles) {
+        $ProblemFiles .= "'$ProblemFile' ";
+    }
+    return(`$tptp4XCommand $ExtraTPTP4XFlags -d $TemporaryDirectory -t '$Transform' -f '$Format' $ExpandFlag -u machine $ProblemFiles 2>&1 | cat`);
+}
+#--------------------------------------------------------------------------------------------------
+sub TPTP4XCanDo {
+    my ($System,$Transform,$Format,@ProblemFiles) = @_;
+
+    my @Transforms;
+    my $File;
+
+    if ($System =~ /^tptp2X/) {
+#DEBUG print(STDERR "tptp2X requested\n");
+        return(0);
+    }
+
+    if ($Format ne "tptp" && $Format ne "tptp:short" && $Format ne "tptp:long"
+&& $Format ne "tptp:raw" && $Format ne "oldtptp" && $Format ne "dfg" && $Format ne "otter") {
+#DEBUG print(STDERR "$Format is not possible in tptp4X\n");
+        return(0);
+    }
+
+#----Split transforms at +
+    @Transforms = split(/\+/,$Transform);
+
+    foreach $Transform (@Transforms) {
+        if ($Transform ne "none" && $Transform !~ /add_equality/ && $Transform !~ /fofify/ && 
+$Transform !~ /aritize/ && $Transform !~ /dequote/) {
+#DEBUG print(STDERR "$Transform is not OK\n");
+            return(0);
+        }
+#DEBUG print(STDERR "$Transform is OK\n");
+    }
+#DEBUG print(STDERR "@Transforms are all OK\n");
+
+#----Must be plain files
+    foreach $File (@ProblemFiles) {
+#----Strip off any ''s around the file name
+        $File =~ s/^'//;
+        $File =~ s/'$//;
+        if (! -f $File && !ATPTPProblem($File)) {
+#DEBUG print(STDERR "==$File== is not a plain file\n");
+            return(0);
+        }
+    }
+
+    return(1);
+}
+#--------------------------------------------------------------------------------------------------
+sub GetExtraTPTP4XFlags {
+    my ($System) = @_;
+
+    if ($System =~ /^GDV---/) {
+        return("-N");
+    }
+    return("");
+}
+#--------------------------------------------------------------------------------------------------
+sub ATPTPProblem {
+    my ($Problem) = @_;
+
+    my $Domain;
+
+    $Problem =~ s/\.p$//;
+    if ($Problem =~ /^[A-Z]{3}[0-9]{3}/) {
+        ($Domain) = ($Problem =~ /^(...)/);
+        return(-f "$ProblemsDirectory/$Domain/${Problem}.p");
+    } else {
+        return(0);
+    }
+}
+#--------------------------------------------------------------------------------------------------
+sub GetFileNameLike {
+    my ($FileNamePattern,$MaximalInList,$LSFlag) = @_;
+
+    my @ListedFiles;
+
+    @ListedFiles = `ls $LSFlag $FileNamePattern 2>&1`;
+    if (scalar(@ListedFiles) >= 1 && $ListedFiles[0] !~
+/No such file or directory/) {
+        chomp($ListedFiles[0]);
+        if (scalar(@ListedFiles) > $MaximalInList) {
+            print(
+"WARNING: Too many files like $FileNamePattern, returning none of them\n");
+#DEBUG print("The are ==@ListedFiles==\n");
+            return(undef);
+        }
+        if (scalar(@ListedFiles) >= 2) {
+            print(
+"WARNING: Multiple files $FileNamePattern, returning $ListedFiles[0]\n");
+        }
+        return($ListedFiles[0]);
+    } else {
+        return(undef);
+    }
+}
+#--------------------------------------------------------------------------------------------------
+return(1);
+#--------------------------------------------------------------------------------------------------
