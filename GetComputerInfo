@@ -81,7 +81,8 @@ cat << 'EOF'
                 FreeRAM            = Free RAM, not counting cache (MiB)
                 SwapUsed           = Swap space in use (MiB)
                 FreeSwap           = Free swap space (MiB)
-                OS                 = Operating system
+                OS                 = Operating system distribution and kernel,
+                                     e.g. "Ubuntu 24.04.5 LTS, Linux 6.8.0-151-generic"
                 CPULimit           = Value of --cpu-limit
                 WCLimit            = Value of --wc-limit
                 MemLimit           = Value of --mem-limit
@@ -535,8 +536,35 @@ if [[ -n "$MemLimit" ]]; then
     MemLimit=$(awk -v m="$MemLimit" -v f="$MemFactor" 'BEGIN {printf("%dMiB", int(m * f + 0.5))}')
 fi
 
-#----Operating system
-OS=$(uname -s -r)
+#----Operating system: distribution name, then kernel, e.g.
+#----"Ubuntu 24.04.5 LTS, Linux 6.8.0-151-generic". The distribution comes from
+#----PRETTY_NAME in /etc/os-release (or /usr/lib/os-release), read as text rather than
+#----sourced, then lsb_release, then /etc/redhat-release or similar. If none is found,
+#----only the kernel is reported.
+Kernel=$(uname -s -r)
+Distro=""
+for OSRelease in /etc/os-release /usr/lib/os-release; do
+    if [[ -r "$OSRelease" ]]; then
+        Distro=$(awk -F= '/^PRETTY_NAME=/ {v = substr($0, index($0, "=") + 1);
+            gsub(/^["\047]|["\047][ \t]*$/, "", v); print v; exit}' "$OSRelease")
+        if [[ -n "$Distro" ]]; then break; fi
+    fi
+done
+if [[ -z "$Distro" ]] && command -v lsb_release >/dev/null 2>&1; then
+    Distro=$(lsb_release -ds 2>/dev/null | head -n 1)
+    Distro="${Distro#\"}"
+    Distro="${Distro%\"}"
+fi
+if [[ -z "$Distro" ]]; then
+    for ReleaseFile in /etc/redhat-release /etc/centos-release /etc/SuSE-release /etc/alpine-release; do
+        if [[ -r "$ReleaseFile" ]]; then
+            Distro=$(head -n 1 "$ReleaseFile")
+            if [[ "$ReleaseFile" == /etc/alpine-release ]]; then Distro="Alpine Linux $Distro"; fi
+            break
+        fi
+    done
+fi
+if [[ -n "$Distro" ]]; then OS="$Distro, $Kernel"; else OS="$Kernel"; fi
 
 #----Current date and time, e.g. "Tue Nov  3 17:43:12 UTC 2026"
 DateTime=$(date '+%a %b %e %H:%M:%S %Z %Y')
